@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sqlalchemy import create_engine, inspect, text, event
+from sqlalchemy import create_engine, inspect, text
 import urllib
 import io
 import traceback
@@ -22,48 +22,41 @@ def mapear_columnas(df_cols, columnas_sql):
     }
 
 
-def bulk_insert_fast(df, table, schema, engine):
+def bulk_insert(df, table, schema, engine):
     columnas = ",".join(f"[{c}]" for c in df.columns)
-    params = ",".join("?" for _ in df.columns)
+    params = ",".join(":" + c for c in df.columns)
 
-    sql = f"INSERT INTO [{schema}].[{table}] ({columnas}) VALUES ({params})"
-    data = [tuple(row) for row in df.itertuples(index=False, name=None)]
-
-    with engine.begin() as conn:
-        cursor = conn.connection.cursor()
-        cursor.fast_executemany = True
-        cursor.executemany(sql, data)
-
-
-# ======================================================
-# 🔗 CONEXIÓN SQL SERVER (DINÁMICA POR USUARIO)
-# ======================================================
-def crear_engine(servidor, database, username, password):
-    driver = "ODBC Driver 17 for SQL Server"
-
-    params = urllib.parse.quote_plus(
-        f"DRIVER={driver};"
-        f"SERVER={servidor};"
-        f"DATABASE={database};"
-        f"UID={username};"
-        f"PWD={password}"
+    sql = text(
+        f"INSERT INTO [{schema}].[{table}] ({columnas}) VALUES ({params})"
     )
 
-    engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
+    data = df.to_dict(orient="records")
 
-    @event.listens_for(engine, "before_cursor_execute")
-    def enable_fast_executemany(conn, cursor, statement, parameters, context, executemany):
-        if executemany and hasattr(cursor, "fast_executemany"):
-            cursor.fast_executemany = True
+    with engine.begin() as conn:
+        conn.execute(sql, data)
 
+
+# ======================================================
+# 🔗 CONEXIÓN SQL SERVER (INTERNET / PYTDS)
+# ======================================================
+def crear_engine(servidor, database, username, password, puerto):
+    engine = create_engine(
+        f"mssql+pytds://{username}:{password}@{servidor}:{puerto}/{database}"
+    )
     return engine
 
 
 # ======================================================
 # 🚀 UI CONFIG
 # ======================================================
-st.set_page_config("Importador Excel → SQL", "📊", layout="wide")
+st.set_page_config(
+    page_title="Importador Excel → SQL Server",
+    page_icon="📊",
+    layout="wide"
+)
+
 st.title("📊 Importador Excel → SQL Server")
+st.caption("Aplicación web – Streamlit Cloud")
 
 # ======================================================
 # 🔐 0️⃣ CONEXIÓN A SQL SERVER
@@ -71,16 +64,27 @@ st.title("📊 Importador Excel → SQL Server")
 st.subheader("🔐 Conexión a SQL Server")
 
 with st.form("conexion_sql"):
-    servidor = st.text_input("Servidor", placeholder="CSPLCDB02\\QADEV")
-    database = st.text_input("Base de datos", placeholder="ReportesCdg_Temporales")
-    username = st.text_input("Usuario")
+    servidor = st.text_input(
+        "Servidor (IP o DNS)",
+        placeholder="sql.midominio.com o 200.50.xxx.xxx"
+    )
+    puerto = st.number_input("Puerto", value=1433, step=1)
+    database = st.text_input("Base de datos")
+    username = st.text_input("Usuario SQL")
     password = st.text_input("Contraseña", type="password")
 
-    conectar = st.form_submit_button("Conectar")
+    conectar = st.form_submit_button("🔌 Conectar")
 
 if conectar:
     try:
-        engine = crear_engine(servidor, database, username, password)
+        engine = crear_engine(
+            servidor.strip(),
+            database.strip(),
+            username.strip(),
+            password,
+            puerto
+        )
+
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
 
@@ -89,7 +93,7 @@ if conectar:
 
     except Exception as e:
         st.error("❌ Error de conexión")
-        st.text(e)
+        st.code(str(e))
         st.stop()
 
 if "engine" not in st.session_state:
@@ -119,7 +123,7 @@ columnas_sql_norm = [normalizar_col(c) for c in columnas_sql]
 st.subheader("2️⃣ Subir archivos Excel")
 
 uploaded_files = st.file_uploader(
-    "Selecciona uno o más archivos",
+    "Selecciona uno o más archivos Excel",
     type=["xlsx", "xls"],
     accept_multiple_files=True
 )
@@ -145,14 +149,14 @@ st.subheader("3️⃣ Seleccionar hoja")
 for name, info in st.session_state["files"].items():
     xls = pd.ExcelFile(io.BytesIO(info["bytes"]))
     hoja = st.selectbox(
-        f"{name}",
+        f"Archivo: {name}",
         xls.sheet_names,
         key=f"sheet_{name}"
     )
     info["sheet"] = hoja
 
 # ======================================================
-# OPCIONES GLOBALES
+# OPCIONES
 # ======================================================
 st.markdown("---")
 ignorar_extras = st.checkbox("Ignorar columnas extra en Excel", value=True)
@@ -167,7 +171,10 @@ if st.button("🚀 Validar y cargar a SQL Server"):
 
     for i, (name, info) in enumerate(st.session_state["files"].items(), start=1):
         try:
-            df = pd.read_excel(io.BytesIO(info["bytes"]), sheet_name=info["sheet"])
+            df = pd.read_excel(
+                io.BytesIO(info["bytes"]),
+                sheet_name=info["sheet"]
+            )
             df = df.replace({np.nan: None})
 
             cols_excel_norm = [normalizar_col(c) for c in df.columns]
@@ -175,24 +182,26 @@ if st.button("🚀 Validar y cargar a SQL Server"):
             extras = set(cols_excel_norm) - set(columnas_sql_norm)
 
             if faltantes:
-                st.error(f"❌ {name}: Faltan columnas obligatorias")
+                st.error(f"❌ {name}: faltan columnas obligatorias")
                 continue
 
             if extras and not ignorar_extras:
-                st.error(f"❌ {name}: Tiene columnas extra")
+                st.error(f"❌ {name}: contiene columnas extra")
                 continue
 
+            # Filtrar y mapear columnas
             df = df[[c for c in df.columns if normalizar_col(c) in columnas_sql_norm]]
             df.rename(columns=mapear_columnas(df.columns, columnas_sql), inplace=True)
             df = df[[c for c in columnas_sql if c in df.columns]]
 
-            bulk_insert_fast(df, tabla_sel, schema_sel, engine)
+            # Insertar
+            bulk_insert(df, tabla_sel, schema_sel, engine)
 
             st.success(f"✅ {name} cargado correctamente")
 
         except Exception as e:
-            st.error(f"❌ Error en {name}: {e}")
-            st.text(traceback.format_exc())
+            st.error(f"❌ Error en {name}")
+            st.code(traceback.format_exc())
 
         progreso.progress(i / total)
 
